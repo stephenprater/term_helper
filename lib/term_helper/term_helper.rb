@@ -21,25 +21,26 @@ module TermHelper
     setab = "#{setab[0]}%s#{setab[-1]}"
 
     COLOR_LIST = {
-      black: 1,
+      black: 0,
+      red: 1,
       green: 2,
-      gray: 3,
-      lime: 4,
-      silver: 5,
-      olive: 6,
+      yellow: 3,
+      blue: 4,
+      magenta: 5,
+      cyan: 6,
       white: 7,
-      yellow: 8,
-      red: 9,
-      navy: 10,
-      maroon: 11,
-      blue: 12,
-      purple: 13,
-      teal: 14,
-      fuchsia: 15,
-      aqua: 16
+      gray: 8,
+      bold_red: 9,
+      bold_green: 10,
+      bold_yellow: 11,
+      bold_blue: 12,
+      bold_magenta: 13,
+      bold_cyan: 14,
+      bold_white: 15
     }
 
-      
+    #These commands have well defined output for a given terminal, so
+    #we cache the strings in order to not call tput on every command
     COMMANDS = {
     clear_screen: `tput clear`,
     save: `tput sc`,
@@ -63,6 +64,7 @@ module TermHelper
       movmts[:hpa] % col
     end,
     setab: lambda do |color|
+      color = color.is_a?(Symbol) ? COLOR_LIST[color] : color
       str = ""
       if color < 8
         str = "4#{color}"
@@ -75,6 +77,7 @@ module TermHelper
     end,
     background: :setab,
     setaf: lambda do |color|
+      color = color.is_a?(Symbol) ? COLOR_LIST[color] : color
       str = ""
       if color < 8
         str = "3#{color}"
@@ -105,21 +108,48 @@ module TermHelper
       if b.is_a?(Symbol) and self.respond_to? b
         alias_method meth, b
       else
-        c = b.is_a?(Proc) ? b : lambda { b }
-        define_method meth, &c
+        begin
+          c = b.is_a?(Proc) ? b : lambda { b }
+          define_method meth, &c
+        rescue ArgumentError => e
+          puts e
+          raise
+        end
       end
     end
+
+    attr_accessor :default_color
+
+    def initialize options = {} 
+      options.reverse_merge!({
+        :color => 2
+      })
+      @default_color = options[:color]
+    end
+
   end
   
   attr_reader :cache
 
-  # abstractions around common escape sequences or construction
+
+  #Output to a string given as an argument, to an empty string if no argument
+  #is given, or to an IO if one is given. In the case of the IO the output
+  #is not written until the entire string is built.  In the case of
+  #a string, the string is modified in place.
+  #in all cases, the method returns it's output string
   def output string = nil 
-    to_stdout = true if string
-    string = "" unless string.respond_to? :<<
+    if string.is_a? IO
+      to_io = true
+      dest = string
+      string = ""
+    else
+      string = "" unless string.respond_to? :<<
+    end
+   
     yield(string) if block_given? # modifiy str in place
-    if to_stdout 
-      $stdout << string
+    
+    if to_io
+      dest << string
     end
     string
   end
@@ -139,62 +169,147 @@ module TermHelper
     system("stty -echo; tput u7; read -d R x; stty echo; echo ${x#??} >> #{@temp_file.path}")
     @temp_file.gets.chomp.split(';').map(&:to_i)
   end
-  
+ 
+  # you should not need to call this function.  It is called by the ObjectSpace finalizer to delete
+  # the position file when the TermHelper is garbage collected
   def remove_tempfile(path)
     proc { system "rm #{path}"; } 
   end
   module_function :remove_tempfile
 
+  # Output the results of the block in the color provided, which
+  # can be an integer, or a named color up to sixteen
   def color color
+    @_last_color ||= []
     output do |str|
-      str << c.setaf(color)
-      str << yield(str)
-      str << c.reset
+      str << c.setaf(@_last_color.push(color).last)
+      yield(str)
+      str << c.setaf(@_last_color.tap {|c| c.pop }.last || c.default_color )
     end
   end
 
+  # Return the current size of the terminal window
   def size
-    {:rows => `tput lines`.chomp, :cols => `tput cols`.chomp}
+    {:rows => `tput lines`.chomp.to_i, :cols => `tput cols`.chomp.to_i }
   end
 
+  # Save the current position of the cursor, draw some stuff,
+  # then return the current positin of the cursor. an exception
+  # is raised if there and backs are nested within each other.
   def there_and_back
     raise "nested there_and_back" if @within
     @within = true
-    string = output do |str|
+    output do |str|
       str << c.save 
       yield(str)
       str << c.restore
     end
-    string
   ensure
     @within = false
   end
 
-  def symbols 
+  def char_set set
+    @_last_set ||= []
     output do |str|
-      str << c.smacs 
-      str << yield(str)
-      str << c.rmacs 
+      str << @_last_set.push(set).last
+      yield(str)
+      str << (@_last_set.pop == c.rmacs ? c.smacs : c.rmacs) || c.rmacs
     end
   end
+  private :char_set
 
-  def symbol arg
-    "#{c.smacs}#{arg}#{c.rmacs}"
+  # Render symbols within the provided block
+  def symbol arg = nil, &block
+    if block and not arg
+      char_set c.smacs, &block 
+    elsif arg and not block
+      @_last_set.last == c.rmacs ? "#{c.smacs}#{arg.to_s}#{c.rmacs}" : arg.to_s 
+    else
+      raise "couldn't determine current character set"
+    end
   end
+  alias :symbols :symbol
 
-  def macro name, arr = nil
+  def alpha arg = nil, &block
+    if block and not arg
+      char_set c.rmacs, &block 
+    elsif arg and not block
+      @_last_set.last == c.smacs ? "#{c.rmacs}#{arg.to_s}#{c.smacs}" : arg.to_s 
+    else
+      raise "couldn't determine current character set"
+    end
+  end
+  alias :alphas :alpha
+
+  def ol_macro name, arr = nil, &block
     string = ""
-    if (block_given? and arr) or (not block_given? and not arr)
-      raise ArgumentError "Array of commands or a block required."
-    elsif block_given?
-      str = ""
-      string = yield str
+    if block_given?
+      string = yield
     elsif arr
       string = arr.inject "" do |c| 
         self.__send__ *c
       end
     end
     @cache.define_singleton_method(name) { string }
+  end
+  private :ol_macro
+
+  def fl_macro name, &block
+    raise ArgumentError "Function like macros require a block" if block.nil?
+    # we need to retrieve the proc source, then replace each occurence of any arguments
+    # with a dummyvalue we can identify in the subsequent command string.
+    # then, we can do simple % substitition on the memoized macro string
+    #file, line = block.source_location
+    #File.open(file) do |f|
+    #  lines = f.each_line
+    #  (line - 1).times { lines.next }
+    #  macro_string = lines.next
+    #  raise "no macro at location" unless ident = macro_string.match(/macro/).begin(0)
+    #  loop do 
+    #    line = lines.next
+    #    macro_string << line 
+    #    break if line.match(/end/).try(:begin,0) == ident
+    #  end
+    #  puts "macro---"
+    #  puts macro_string 
+    #end
+    @cache.define_singleton_method(name, &block) 
+  end
+  private :fl_macro
+  
+  # Memoize a sequence of commands as a string. For example, moving to the last column
+  # and drawing an X.  You can also create function like macros, which have the effect
+  # of defining singleton methods on the self and calling them as needed.
+  # TODO make the function like macros memoize to text and do string substitution on them
+  # although that's going to require ripper, etc.
+  # Variables defined within the scope of the macro block will be memoized
+  # when the macro is created, so they probably will not work as you 
+  # expect. If you need a changing value within a macro, you need specify
+  # a block argument for it.  In general, if you find yourself needing 
+  # to do calculations in a macro, you should define a method on
+  # your object.
+  # If you REALLY don't want to do that, use the "context" method
+  def macro name, arr = nil, &block
+    if (not block.nil? and arr) or (block.nil? and not arr)
+      raise ArgumentError "Array of commands or a block required."
+    end
+    
+    if block.arity > 0
+      fl_macro name, &block
+    else
+      if arr
+        ol_macro name, arr
+      elsif not block.nil
+        ol_macro name, &block
+      end
+    end
+  end
+
+  def context name, &block
+    unless @cache.respond_to? :name
+      raise "can't create context for a macro that doesn't exisit"
+    end
+    self.define_singleton_method(name, &block)
   end
 
   def window row,col, width, height, opts = {}
