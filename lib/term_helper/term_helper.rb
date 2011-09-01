@@ -1,4 +1,5 @@
 require 'singleton'
+require 'pry'
 
 module TermHelper
   class CommandCache
@@ -117,16 +118,6 @@ module TermHelper
         end
       end
     end
-
-    attr_accessor :default_color
-
-    def initialize options = {} 
-      options.reverse_merge!({
-        :color => 2
-      })
-      @default_color = options[:color]
-    end
-
   end
   
   attr_reader :cache
@@ -257,38 +248,44 @@ module TermHelper
   def fl_macro name, &block
     raise ArgumentError "Function like macros require a block" if block.nil?
     # we need to retrieve the proc source, then replace each occurence of any arguments
-    # with a dummyvalue we can identify in the subsequent command string.
+    # with the subsitition we can identify in the subsequent command string.
     # then, we can do simple % substitition on the memoized macro string
-    #file, line = block.source_location
-    #File.open(file) do |f|
-    #  lines = f.each_line
-    #  (line - 1).times { lines.next }
-    #  macro_string = lines.next
-    #  raise "no macro at location" unless ident = macro_string.match(/macro/).begin(0)
-    #  loop do 
-    #    line = lines.next
-    #    macro_string << line 
-    #    break if line.match(/end/).try(:begin,0) == ident
-    #  end
-    #  puts "macro---"
-    #  puts macro_string 
-    #end
-    @cache.define_singleton_method(name, &block) 
+    file, line = block.source_location
+    File.open(file) do |f|
+      lines = f.each_line
+      (line - 1).times { lines.next }
+      raise "no macro at location" unless ident = lines.next.match(/macro/).begin(0)
+      macro_string = lines.each_with_object "" do |line, memo|
+        break memo if line.match(/end/).try(:begin,0) == ident
+        block.parameters.each do |arg|
+          if arg[0] == :rest
+            raise "Macros cannot accomodate splat parameters"
+          end
+          arg = arg[1]
+          line.gsub!(/(widget.*?[ )])/,'\'#{\1}\'')
+          line.gsub!(/(?:[ ](#{arg}.*?)\s/,'\'#{\1}\'') # avoid double substitution
+        end
+        memo << line 
+      end
+      puts macro_string
+      binding.pry
+      # eval the macro string, but use #{substitution} in place of our
+      # parameters
+      macro_output = eval(macro_string,block.binding,file,line)
+    end
   end
   private :fl_macro
   
-  # Memoize a sequence of commands as a string. For example, moving to the last column
-  # and drawing an X.  You can also create function like macros, which have the effect
-  # of defining singleton methods on the self and calling them as needed.
-  # TODO make the function like macros memoize to text and do string substitution on them
-  # although that's going to require ripper, etc.
-  # Variables defined within the scope of the macro block will be memoized
-  # when the macro is created, so they probably will not work as you 
-  # expect. If you need a changing value within a macro, you need specify
-  # a block argument for it.  In general, if you find yourself needing 
-  # to do calculations in a macro, you should define a method on
-  # your object.
-  # If you REALLY don't want to do that, use the "context" method
+  # Memoize a sequence of commands as a string. 
+  # You can create either simple macros, which are just a list of commands
+  # or function like macros, which take arguments. Note that these function
+  # like macros are NOT FUNCTIONS. You can't operate on the values passed
+  # into a function-like macro, you have to use it basically as it comes in.
+  # A good rule of thumb, if you're sending a message to a parameter to get
+  # a different value which you want to do something else with, you want to
+  # use #widget and not macro.
+  # a good use of a macro: drawing the name of your program in ascii art.
+  # a bad use of a macro: a progress bar.
   def macro name, arr = nil, &block
     if (not block.nil? and arr) or (block.nil? and not arr)
       raise ArgumentError "Array of commands or a block required."
@@ -304,11 +301,9 @@ module TermHelper
       end
     end
   end
-
-  def context name, &block
-    unless @cache.respond_to? :name
-      raise "can't create context for a macro that doesn't exisit"
-    end
+  
+  # define a singleton method on the object which includes term_helper
+  def widget name, &block
     self.define_singleton_method(name, &block)
   end
 
@@ -377,7 +372,7 @@ class TermPainter
     self.class.cache
   end
 
-  undef :build_cache
+  undef :build_cache rescue nil
    
   def draw 
     buffer = ""
