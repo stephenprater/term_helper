@@ -1,5 +1,6 @@
 require 'singleton'
 require 'pry'
+require 'forwardable'
 
 module TermHelper
   class CommandCache
@@ -43,7 +44,7 @@ module TermHelper
     #These commands have well defined output for a given terminal, so
     #we cache the strings in order to not call tput on every command
     COMMANDS = {
-    clear_screen: `tput clear`,
+    clear_all: `tput clear`,
     save: `tput sc`,
     restore: `tput rc`,
     reset: `tput sgr0`,
@@ -120,9 +121,6 @@ module TermHelper
     end
   end
   
-  attr_reader :cache
-
-
   #Output to a string given as an argument, to an empty string if no argument
   #is given, or to an IO if one is given. In the case of the IO the output
   #is not written until the entire string is built.  In the case of
@@ -150,32 +148,23 @@ module TermHelper
   end
 
   def current_position
-    #taking bids for a better implementation of this
-    unless @temp_file 
+    unless _temp_file 
       system "mkfifo /tmp/#{self.class}_#{uniq_id}"
-      @temp_file = File.open("/tmp/#{self.class}_#{uniq_id}","w+")
-      ObjectSpace.define_finalizer(self, TermHelper.remove_tempfile(@temp_file.path)) 
-    end 
+      _temp_file = File.open("/tmp/#{self.class}_#{uniq_id}","w+")
+    end  
 
-    system("stty -echo; tput u7; read -d R x; stty echo; echo ${x#??} >> #{@temp_file.path}")
-    @temp_file.gets.chomp.split(';').map(&:to_i)
+    #taking bids for a better implementation of this
+    system("stty -echo; tput u7; read -d R x; stty echo; echo ${x#??} >> #{_temp_file.path}")
+    _temp_file.gets.chomp.split(';').map(&:to_i)
   end
  
-  # you should not need to call this function.  It is called by the ObjectSpace finalizer to delete
-  # the position file when the TermHelper is garbage collected
-  def remove_tempfile(path)
-    proc { system "rm #{path}"; } 
-  end
-  module_function :remove_tempfile
-
   # Output the results of the block in the color provided, which
   # can be an integer, or a named color up to sixteen
   def color color
-    @_last_color ||= []
     output do |str|
-      str << c.setaf(@_last_color.push(color).last)
+      str << _last_color.push(c.setaf(color)).last
       yield(str)
-      str << c.setaf(@_last_color.tap {|c| c.pop }.last || c.default_color )
+      str << (_last_color.tap { |c| c.pop }.last || (c.reset + _last_set.last.to_s))
     end
   end
 
@@ -189,22 +178,20 @@ module TermHelper
   # is raised if there and backs are nested within each other.
   def there_and_back
     raise "nested there_and_back" if @within
-    @within = true
+    _within = true
     output do |str|
       str << c.save 
       yield(str)
       str << c.restore
     end
-  ensure
-    @within = false
+    _within = false
   end
 
   def char_set set
-    @_last_set ||= []
     output do |str|
-      str << @_last_set.push(set).last
+      str << _last_set.push(set).last
       yield(str)
-      str << (@_last_set.pop == c.rmacs ? c.smacs : c.rmacs) || c.rmacs
+      str << (_last_set.tap { |c| c.pop }.last || (c.reset + _last_color.last.to_s)) 
     end
   end
   private :char_set
@@ -214,7 +201,7 @@ module TermHelper
     if block and not arg
       char_set c.smacs, &block 
     elsif arg and not block
-      @_last_set.last == c.rmacs ? "#{c.smacs}#{arg.to_s}#{c.rmacs}" : arg.to_s 
+      _last_set.last == c.rmacs ? "#{c.smacs}#{arg.to_s}#{c.rmacs}" : arg.to_s 
     else
       raise "couldn't determine current character set"
     end
@@ -225,7 +212,7 @@ module TermHelper
     if block and not arg
       char_set c.rmacs, &block 
     elsif arg and not block
-      @_last_set.last == c.smacs ? "#{c.rmacs}#{arg.to_s}#{c.smacs}" : arg.to_s 
+      _last_set.last == c.smacs ? "#{c.rmacs}#{arg.to_s}#{c.smacs}" : arg.to_s 
     else
       raise "couldn't determine current character set"
     end
@@ -249,29 +236,37 @@ module TermHelper
     raise ArgumentError "Function like macros require a block" if block.nil?
     # we need to retrieve the proc source, then replace each occurence of any arguments
     # with the subsitition we can identify in the subsequent command string.
-    # then, we can do simple % substitition on the memoized macro string
+    # then, we can do simple substitition on the memoized macro string
     file, line = block.source_location
     File.open(file) do |f|
       lines = f.each_line
       (line - 1).times { lines.next }
-      raise "no macro at location" unless ident = lines.next.match(/macro/).begin(0)
+      raise "no macro at location #{file}, #{line}" unless ident = lines.next.match(/macro/).try(:begin,0)
       macro_string = lines.each_with_object "" do |line, memo|
         break memo if line.match(/end/).try(:begin,0) == ident
-        block.parameters.each do |arg|
-          if arg[0] == :rest
-            raise "Macros cannot accomodate splat parameters"
-          end
-          arg = arg[1]
-          line.gsub!(/(widget.*?[ )])/,'\'#{\1}\'')
-          line.gsub!(/(?:[ ](#{arg}.*?)\s/,'\'#{\1}\'') # avoid double substitution
-        end
         memo << line 
       end
-      puts macro_string
-      binding.pry
-      # eval the macro string, but use #{substitution} in place of our
-      # parameters
-      macro_output = eval(macro_string,block.binding,file,line)
+      args = block.parameters.collect do |arg|
+        (arg[0] == :rest) ? (raise "Macros cannot accomodate splat parameters") : arg[1]
+      end
+      regex = /(self.*?[ )\n;])|(?:(?:[ (])((?:#{args.map(&:to_s).join('|')}).*?)[ ()\n])/
+      #rewrite each line of the macro to sub in any arguments
+      rewritten = macro_string.lines.each_with_object "" do |line,memo|
+        line.scan(regex).entries.each do |match|
+          mtr = match[0] || match[1]
+          line.gsub!(mtr,'\'#{' + mtr +'}\'')
+        end
+        memo << line
+      end
+      # create the macro string
+      macro_string = eval(rewritten, block.binding)
+      @cache.instance_eval do
+        eval(<<-DEF, binding, file, line)
+          def #{name}(#{args.join(", ")})
+            \"#{macro_string}\"
+          end
+        DEF
+      end
     end
   end
   private :fl_macro
@@ -296,62 +291,66 @@ module TermHelper
     else
       if arr
         ol_macro name, arr
-      elsif not block.nil
+      elsif not block.nil?
         ol_macro name, &block
       end
     end
   end
   
   # define a singleton method on the object which includes term_helper
+  # it can also define a s
   def widget name, &block
-    self.define_singleton_method(name, &block)
-  end
-
-  def window row,col, width, height, opts = {}
-    opts = {:color => false, :noblank => false}.merge(opts)
-    str = there_and_back do |str|
-      str << c.setaf(opts[:color]) if opts[:color]
-      str << c.moveto(row,col)
-      str << smacs { 'm'+('q' * width)+'j' }
-      str << c.mrcup(0, -(width + 2))
-      (height-2).times do
-        str << c.mrcup(-1,0)
-        str << smacs { 'x' }
-        if opts[:noblank]
-          str << c.mrcup(0,width)
-        else
-          str << ' ' * width
-        end
-        str << smacs { 'x' }
-        str << c.mrcup(0,-(width + 2))
-      end
-      str << smacs { 'l' + ('q' * width) + 'k'}
-      str << c.reset
-      if block_given?
-        str << c.mrcup(1,0)
-        string = (yield).scan(/.{0,#{width}}/)
-        string = string.length > rows ? string[0..rows] : string
-        string.each do |l|
-          str << c.mrcup(0,col)
-          str << l + "\n"
-        end
-      end
+    if name.is_a? Symbol and block_given?
+      self.define_singleton_method(name, &block)
+    elsif name.respond_to? :block
+      self.define_singleton_method(name.name, &name.block)
     end
   end
-  
-  def c
-    @cache
-  end
+
+  attr_reader :cache
+  alias :c :cache
 
   def build_cache
     @cache = CommandCache.new
+    owner = self
+    @cache.define_singleton_method :method_missing do |method, *args, &block|
+      if owner.respond_to? method
+        owner.send method, *args, &block
+      else
+        raise NoMethodError, "couldn't fine #{method} in cache or object"
+      end
+    end
   end
   private :build_cache
-  
-  @cache = CommandCache.new
 
-  def self.cache
-    @cache
+  extend Forwardable
+
+  # these are module level items so that more than
+  # one atelier can draw on the screen at a time
+  @_last_set = []
+  @_last_color = []
+  @_within = false
+  @_temp_file = nil
+  @cache = CommandCache.new # the default command cache
+  
+  def_delegators :TermHelper, :_last_color, :_last_set, :_within, :_temp_file 
+
+  class << self
+    attr_accessor :_last_color, :_last_set, :_within, :_temp_file 
+
+    def remove_tempfile
+      if @_temp_file
+        proc { system "rm #{@_temp_file.path}"; } 
+      else
+        proc { }
+      end
+    end
+
+    def cache
+      @cache
+    end
+    
+    ObjectSpace.define_finalizer(TermHelper, TermHelper.remove_tempfile())
   end
 end
 
@@ -388,3 +387,46 @@ class TermPainter
     end
   end
 end
+
+class TermHelper::Widget
+  attr_reader :block, :name
+  def initialize name, &block
+    @block = block
+    @name = name
+  end
+end
+
+TermHelper::Widget.new :window do |row,col, width, height, opts = {}|
+  opts = {:color => false, :noblank => false}.merge(opts)
+  str = there_and_back do |str|
+    str << c.setaf(opts[:color]) if opts[:color]
+    str << c.moveto(row,col)
+    str << smacs { 'm'+('q' * width)+'j' }
+    str << c.mrcup(0, -(width + 2))
+    (height-2).times do
+      str << c.mrcup(-1,0)
+      str << smacs { 'x' }
+      if opts[:noblank]
+        str << c.mrcup(0,width)
+      else
+        str << ' ' * width
+      end
+      str << smacs { 'x' }
+      str << c.mrcup(0,-(width + 2))
+    end
+    str << smacs { 'l' + ('q' * width) + 'k'}
+    str << c.reset
+    if block_given?
+      str << c.mrcup(1,0)
+      string = (yield).scan(/.{0,#{width}}/)
+      string = string.length > rows ? string[0..rows] : string
+      string.each do |l|
+        str << c.mrcup(0,col)
+        str << l + "\n"
+      end
+    end
+  end
+end
+
+    
+
